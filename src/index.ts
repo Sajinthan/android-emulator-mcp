@@ -29,8 +29,16 @@ const EMULATOR = sdkTool("emulator/emulator", "emulator");
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 async function run(bin: string, args: string[]): Promise<string> {
-  const { stdout, stderr } = await execFileAsync(bin, args, { maxBuffer: 64 * 1024 * 1024 });
-  return stdout || stderr;
+  try {
+    const { stdout, stderr } = await execFileAsync(bin, args, { maxBuffer: 64 * 1024 * 1024 });
+    return stdout || stderr;
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException & { stderr?: string; stdout?: string };
+    if (err.code === "ENOENT") {
+      throw new Error(`${bin} not found. Set ANDROID_HOME to your Android SDK directory.`);
+    }
+    throw new Error((err.stderr || err.stdout || err.message).trim());
+  }
 }
 
 async function runBinary(bin: string, args: string[]): Promise<Buffer> {
@@ -84,6 +92,9 @@ function pngSize(png: Buffer): { w: number; h: number } | null {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+const READ_ONLY = { readOnlyHint: true };
+const DESTRUCTIVE = { destructiveHint: true };
 
 const serialParam = z
   .string()
@@ -184,6 +195,32 @@ function parseUiDump(xml: string, includeAll: boolean): UiNode[] {
   return nodes;
 }
 
+/** One node per line keeps large trees cheap to read. */
+function formatNodes(nodes: UiNode[]): string {
+  return nodes.length ? nodes.map((n) => JSON.stringify(n)).join("\n") : "(no elements)";
+}
+
+function matches(n: UiNode, q: string): boolean {
+  return !!(
+    n.text?.toLowerCase().includes(q) ||
+    n.contentDesc?.toLowerCase().includes(q) ||
+    n.resourceId?.toLowerCase().includes(q)
+  );
+}
+
+async function runningAvds(): Promise<Record<string, string>> {
+  const running: Record<string, string> = {};
+  for (const serial of await listSerials()) {
+    if (!serial.startsWith("emulator-")) continue;
+    try {
+      running[serial] = (await adb(serial, ["emu", "avd", "name"])).split("\n")[0].trim();
+    } catch {
+      running[serial] = "unknown";
+    }
+  }
+  return running;
+}
+
 async function uiDump(serial: string): Promise<string> {
   // uiautomator occasionally fails with "could not get idle state"; retry a few times.
   let lastErr = "";
@@ -215,6 +252,7 @@ server.registerTool(
   {
     description: "List available Android Virtual Devices (AVDs) and currently connected devices/emulators",
     inputSchema: {},
+    annotations: READ_ONLY,
   },
   async () => {
     const avds = (await run(EMULATOR, ["-list-avds"]))
@@ -222,16 +260,7 @@ server.registerTool(
       .map((l) => l.trim())
       .filter((l) => l && !l.startsWith("INFO"));
     const devices = await run(ADB, ["devices", "-l"]);
-    const running: Record<string, string> = {};
-    for (const serial of await listSerials()) {
-      if (serial.startsWith("emulator-")) {
-        try {
-          running[serial] = (await adb(serial, ["emu", "avd", "name"])).split("\n")[0].trim();
-        } catch {
-          running[serial] = "unknown";
-        }
-      }
-    }
+    const running = await runningAvds();
     return text(
       JSON.stringify({ avds, running_emulators: running, adb_devices: devices.trim() }, null, 2)
     );
@@ -249,6 +278,10 @@ server.registerTool(
     },
   },
   async ({ avd, timeout_seconds, wipe_data }) => {
+    if (!wipe_data) {
+      const existing = Object.entries(await runningAvds()).find(([, name]) => name === avd);
+      if (existing) return text(`Already running ${avd} as ${existing[0]}`);
+    }
     const before = new Set(await listSerials());
     const args = ["-avd", avd, "-no-snapshot-save"];
     if (wipe_data) args.push("-wipe-data");
@@ -288,6 +321,7 @@ server.registerTool(
   {
     description: "Get the serial(s) of currently connected devices/emulators",
     inputSchema: {},
+    annotations: READ_ONLY,
   },
   async () => text(JSON.stringify(await listSerials()))
 );
@@ -298,6 +332,7 @@ server.registerTool(
     description:
       "Get the screen size (pixels) and density. Screenshots, tap coordinates and describe_ui bounds all share this same pixel coordinate space — no scaling needed.",
     inputSchema: { serial: serialParam },
+    annotations: READ_ONLY,
   },
   async ({ serial }) => {
     const s = await resolveSerial(serial);
@@ -338,6 +373,7 @@ server.registerTool(
   {
     description: "Uninstall an app by package name",
     inputSchema: { serial: serialParam, package: z.string() },
+    annotations: DESTRUCTIVE,
   },
   async ({ serial, package: pkg }) => {
     const s = await resolveSerial(serial);
@@ -354,6 +390,7 @@ server.registerTool(
       serial: serialParam,
       include_system: z.boolean().default(false),
     },
+    annotations: READ_ONLY,
   },
   async ({ serial, include_system }) => {
     const s = await resolveSerial(serial);
@@ -383,10 +420,14 @@ server.registerTool(
       const out = await shell(s, ["am", "start", "-n", `${pkg}/${activity}`]);
       return text(out.trim());
     }
-    const out = await shell(s, [
-      "monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1",
-    ]);
-    if (/No activities found/i.test(out)) return text(`No launcher activity found for ${pkg}`);
+    const installed = (await shell(s, ["pm", "path", pkg]).catch(() => "")).trim();
+    if (!installed) throw new Error(`${pkg} is not installed. Check with list_apps.`);
+    const out = await shell(s, ["monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1"]).catch(
+      (e: Error) => e.message
+    );
+    if (/No activities found|monkey aborted/i.test(out)) {
+      throw new Error(`${pkg} has no launcher activity; pass an explicit activity.`);
+    }
     return text(`Launched ${pkg}`);
   }
 );
@@ -409,6 +450,7 @@ server.registerTool(
   {
     description: "Clear all data and permissions for an app (like a fresh install)",
     inputSchema: { serial: serialParam, package: z.string() },
+    annotations: DESTRUCTIVE,
   },
   async ({ serial, package: pkg }) => {
     const s = await resolveSerial(serial);
@@ -443,6 +485,7 @@ server.registerTool(
       return_image: z.boolean().default(true).describe("Also return the image inline"),
       inline_max_px: z.number().default(800).describe("Longest side of the inline image; 0 = full resolution"),
     },
+    annotations: READ_ONLY,
   },
   async ({ serial, output_path, return_image, inline_max_px }) => {
     const s = await resolveSerial(serial);
@@ -486,12 +529,13 @@ server.registerTool(
       include_all: z.boolean().default(false).describe("Include every node, not just interesting ones"),
       raw_xml: z.boolean().default(false).describe("Return the raw uiautomator XML instead"),
     },
+    annotations: READ_ONLY,
   },
   async ({ serial, include_all, raw_xml }) => {
     const s = await resolveSerial(serial);
     const xml = await uiDump(s);
     if (raw_xml) return text(xml);
-    return text(JSON.stringify(parseUiDump(xml, include_all), null, 1));
+    return text(formatNodes(parseUiDump(xml, include_all)));
   }
 );
 
@@ -500,17 +544,42 @@ server.registerTool(
   {
     description: "Find UI elements whose text, content description or resource ID contains the given string (case-insensitive). Returns bounds and tap centers.",
     inputSchema: { serial: serialParam, query: z.string() },
+    annotations: READ_ONLY,
   },
   async ({ serial, query }) => {
     const s = await resolveSerial(serial);
     const q = query.toLowerCase();
-    const matches = parseUiDump(await uiDump(s), true).filter(
-      (n) =>
-        n.text?.toLowerCase().includes(q) ||
-        n.contentDesc?.toLowerCase().includes(q) ||
-        n.resourceId?.toLowerCase().includes(q)
-    );
-    return text(matches.length ? JSON.stringify(matches, null, 1) : `No element matching "${query}"`);
+    const found = parseUiDump(await uiDump(s), true).filter((n) => matches(n, q));
+    return text(found.length ? formatNodes(found) : `No element matching "${query}"`);
+  }
+);
+
+server.registerTool(
+  "wait_for_element",
+  {
+    description: "Poll until an element matching the query appears (or disappears). Useful after navigation or network calls.",
+    inputSchema: {
+      serial: serialParam,
+      query: z.string(),
+      timeout_seconds: z.number().default(10),
+      gone: z.boolean().default(false).describe("Wait for the element to disappear instead"),
+    },
+    annotations: READ_ONLY,
+  },
+  async ({ serial, query, timeout_seconds, gone }) => {
+    const s = await resolveSerial(serial);
+    const q = query.toLowerCase();
+    const deadline = Date.now() + timeout_seconds * 1000;
+    while (true) {
+      const found = parseUiDump(await uiDump(s), true).filter((n) => matches(n, q));
+      if (gone ? found.length === 0 : found.length > 0) {
+        return text(gone ? `"${query}" is gone` : formatNodes(found));
+      }
+      if (Date.now() > deadline) {
+        throw new Error(`Timed out after ${timeout_seconds}s waiting for "${query}" to ${gone ? "disappear" : "appear"}`);
+      }
+      await sleep(500);
+    }
   }
 );
 
@@ -575,11 +644,13 @@ server.registerTool(
 server.registerTool(
   "type_text",
   {
-    description: "Type text into the currently focused input field",
+    description: "Type text into the currently focused input field (ASCII only — `adb input text` cannot type emoji or non-Latin characters)",
     inputSchema: { serial: serialParam, text: z.string() },
   },
   async ({ serial, text: t }) => {
     const s = await resolveSerial(serial);
+    // eslint-disable-next-line no-control-regex
+    if (/[^\x20-\x7e]/.test(t)) throw new Error("type_text only supports printable ASCII; use key_event or an IME for other characters");
     // `input text` treats %s as a space; quote for the device shell.
     await shell(s, ["input", "text", shq(t.replace(/ /g, "%s"))]);
     return text(`Typed: ${t}`);
@@ -663,6 +734,19 @@ server.registerTool(
   }
 );
 
+server.registerTool(
+  "set_appearance",
+  {
+    description: "Switch the device between light and dark mode",
+    inputSchema: { serial: serialParam, appearance: z.enum(["light", "dark"]) },
+  },
+  async ({ serial, appearance }) => {
+    const s = await resolveSerial(serial);
+    await shell(s, ["cmd", "uimode", "night", appearance === "dark" ? "yes" : "no"]);
+    return text(`Appearance set to ${appearance}`);
+  }
+);
+
 // ── media & location ────────────────────────────────────────────────────────
 
 server.registerTool(
@@ -731,7 +815,9 @@ server.registerTool(
     if (!rec) return text("No active recording");
     recordings.delete(s);
     // Ask screenrecord on the device to stop gracefully so it finalises the file.
-    await shell(s, ["pkill", "-INT", "screenrecord"]).catch(() => {});
+    await shell(s, ["pkill", "-INT", "screenrecord"]).catch(() =>
+      shell(s, ["kill", "-INT", "$(pidof screenrecord)"]).catch(() => {})
+    );
     await new Promise<void>((resolve) => {
       if (rec.proc.exitCode !== null) return resolve();
       rec.proc.once("exit", () => resolve());
@@ -812,6 +898,7 @@ server.registerTool(
       filter: z.string().optional().describe("Case-insensitive regex applied to each line"),
       package: z.string().optional().describe("Only show logs from this app's process"),
     },
+    annotations: READ_ONLY,
   },
   async ({ serial, lines, filter, package: pkg }) => {
     const s = await resolveSerial(serial);
@@ -841,6 +928,44 @@ server.registerTool(
     const s = await resolveSerial(serial);
     await adb(s, ["logcat", "-c"]);
     return text("Logcat cleared");
+  }
+);
+
+// ── files & escape hatch ────────────────────────────────────────────────────
+
+server.registerTool(
+  "push_file",
+  {
+    description: "Copy a local file to the device",
+    inputSchema: { serial: serialParam, local_path: z.string(), remote_path: z.string().describe("e.g. /sdcard/Download/file.txt") },
+  },
+  async ({ serial, local_path, remote_path }) => {
+    const s = await resolveSerial(serial);
+    return text((await adb(s, ["push", local_path, remote_path])).trim());
+  }
+);
+
+server.registerTool(
+  "pull_file",
+  {
+    description: "Copy a file from the device to the local machine",
+    inputSchema: { serial: serialParam, remote_path: z.string(), local_path: z.string() },
+  },
+  async ({ serial, remote_path, local_path }) => {
+    const s = await resolveSerial(serial);
+    return text((await adb(s, ["pull", remote_path, local_path])).trim());
+  }
+);
+
+server.registerTool(
+  "adb_shell",
+  {
+    description: "Run an arbitrary `adb shell` command for anything not covered by the other tools, e.g. 'dumpsys activity activities | head -50'",
+    inputSchema: { serial: serialParam, command: z.string().describe("Command line executed by the device shell") },
+  },
+  async ({ serial, command }) => {
+    const s = await resolveSerial(serial);
+    return text((await shell(s, [command])).trim() || "(no output)");
   }
 );
 

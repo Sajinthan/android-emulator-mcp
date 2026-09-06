@@ -71,10 +71,12 @@ The `serial` parameter (e.g. `emulator-5554`) is optional on every tool when exa
 | `type_text` | Type into the focused input |
 | `press_button` | HOME, BACK, MENU, APP_SWITCH, POWER, VOLUME_UP/DOWN, ENTER, DEL, TAB, CAMERA, SEARCH |
 | `key_event` | Send any Android keycode |
-| `describe_ui` | Compact JSON UI hierarchy with bounds and tap centers |
+| `describe_ui` | Compact JSON UI hierarchy (one element per line) with bounds and tap centers |
 | `find_element` | Find elements by text / content-desc / resource-id |
+| `wait_for_element` | Poll until an element appears or disappears |
 | `shake` | Shake the device (accelerometer, e.g. RN dev menu) |
 | `set_orientation` | Rotate to portrait / landscape |
+| `set_appearance` | Light / dark mode |
 
 ### Media & Location
 | Tool | Description |
@@ -97,6 +99,19 @@ The `serial` parameter (e.g. `emulator-5554`) is optional on every tool when exa
 |---|---|
 | `logcat` | Recent logcat, filterable by regex or package |
 | `clear_logcat` | Clear the logcat buffer |
+
+### Files & Escape Hatch
+| Tool | Description |
+|---|---|
+| `push_file` | Copy a local file to the device |
+| `pull_file` | Copy a file from the device |
+| `adb_shell` | Run any `adb shell` command |
+
+## Notes
+
+- `boot_emulator` returns the existing serial if that AVD is already running instead of starting a second copy.
+- `type_text` is limited to printable ASCII, a limitation of `adb shell input text`.
+- Read-only tools carry the MCP `readOnlyHint` annotation and destructive ones `destructiveHint`, so clients can prompt accordingly.
 
 ## Coordinate System
 
